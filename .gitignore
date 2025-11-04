@@ -13,3 +13,5 @@ ebcc.egg-info
 ebcc/__pycache__
 data/test.zarr
 .venv
+*.hdf5
+*.png
