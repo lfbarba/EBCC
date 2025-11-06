@@ -89,9 +89,9 @@ def compress_frame_worker(args_tuple):
 # ----------------------
 
 
-def load_tiff_sequence(tiff_dir, start_offset=0, max_frames=None):
+def get_tiff_file_list(tiff_dir, start_offset=0, max_frames=None):
     """
-    Load a sequence of TIFF files into a numpy array.
+    Get list of TIFF files to process.
     
     Args:
         tiff_dir: Directory containing TIFF files
@@ -99,7 +99,7 @@ def load_tiff_sequence(tiff_dir, start_offset=0, max_frames=None):
         max_frames: Maximum number of frames to load (None for all)
     
     Returns:
-        tuple: (numpy_array, min_val, max_val, file_list)
+        tuple: (tiff_files, num_frames)
     """
     tiff_path = Path(tiff_dir)
     
@@ -120,44 +120,77 @@ def load_tiff_sequence(tiff_dir, start_offset=0, max_frames=None):
     else:
         tiff_files = tiff_files[start_offset:]
     
-    print(f"Loading {len(tiff_files)} frames (offset: {start_offset})")
+    return tiff_files, len(tiff_files)
+
+
+def scan_tiff_metadata(tiff_files):
+    """
+    Scan TIFF files to get dimensions and value range without loading all data.
     
+    Args:
+        tiff_files: List of TIFF file paths
+    
+    Returns:
+        tuple: (height, width, min_val, max_val, dtype)
+    """
     # Load first image to get dimensions
     first_img = Image.open(tiff_files[0])
     first_array = np.array(first_img)
-    height, width = first_array.shape[:2]
+    
+    if first_array.ndim == 3:
+        height, width = first_array.shape[:2]
+        print("Color images detected - will convert to grayscale using first channel")
+    else:
+        height, width = first_array.shape
+    
+    dtype = first_array.dtype
     
     print(f"Image dimensions: {width} x {height}")
-    print(f"Original dtype: {first_array.dtype}")
+    print(f"Original dtype: {dtype}")
     
-    # Initialize array
-    if first_array.ndim == 2:  # Grayscale
-        data = np.zeros((len(tiff_files), height, width), dtype=np.float32)
-    else:  # Color - convert to grayscale
-        data = np.zeros((len(tiff_files), height, width), dtype=np.float32)
-        print("Color images detected - converting to grayscale")
+    # Scan a subset of frames to estimate min/max
+    # For large sequences, sample every N frames
+    num_samples = min(len(tiff_files), 100)
+    sample_step = max(1, len(tiff_files) // num_samples)
     
-    # Load all images
     global_min = float('inf')
     global_max = float('-inf')
     
-    for i, tiff_file in enumerate(tqdm(tiff_files, desc="Loading TIFF files")):
-        img = Image.open(tiff_file)
+    print(f"Scanning {num_samples} frames to determine value range...")
+    for i in tqdm(range(0, len(tiff_files), sample_step), desc="Scanning metadata"):
+        img = Image.open(tiff_files[i])
         arr = np.array(img)
         
         # Handle color images
         if arr.ndim == 3:
             arr = arr[:, :, 0]  # Take first channel
         
-        data[i] = arr
-        global_min = min(global_min, arr.min())
-        global_max = max(global_max, arr.max())
+        global_min = min(global_min, float(arr.min()))
+        global_max = max(global_max, float(arr.max()))
     
     print(f"Value range: [{global_min}, {global_max}]")
-    print(f"Data shape: {data.shape}")
-    print(f"Memory usage: {data.nbytes / 1e6:.2f} MB")
     
-    return data, global_min, global_max, tiff_files
+    return height, width, global_min, global_max, dtype
+
+
+def load_single_tiff_frame(tiff_file):
+    """
+    Load a single TIFF file as float32 array.
+    
+    Args:
+        tiff_file: Path to TIFF file
+    
+    Returns:
+        numpy array (H, W) as float32
+    """
+    img = Image.open(tiff_file)
+    arr = np.array(img, dtype=np.float32)
+    
+    # Handle color images
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]  # Take first channel
+    
+    return arr
 
 
 def normalize_data(data, min_val, max_val):
@@ -276,28 +309,32 @@ def main():
         default=max(1, mp.cpu_count() - 1),
         help='Number of worker processes to use for parallel encoding (default: cpu_count-1)'
     )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=None,
+        help='Number of frames to process in each batch for parallel mode (default: workers * 2)'
+    )
     
     args = parser.parse_args()
     
     print("=" * 70)
-    print("EBCC TIFF Sequence Compression")
+    print("EBCC TIFF Sequence Compression (Streaming Mode)")
     print("=" * 70)
     
-    # Load TIFF sequence
-    print("\n1. Loading TIFF sequence...")
-    data_original, min_val, max_val, tiff_files = load_tiff_sequence(
+    # Scan TIFF sequence metadata
+    print("\n1. Scanning TIFF sequence...")
+    tiff_files, num_frames = get_tiff_file_list(
         args.tiff_dir,
         start_offset=args.start_offset,
         max_frames=args.max_frames
     )
+    print(f"Processing {num_frames} frames (offset: {args.start_offset})")
     
-    # Normalize data
-    print("\n2. Normalizing data to [0, 1] range...")
-    data_normalized = normalize_data(data_original, min_val, max_val)
-    print(f"Normalized range: [{data_normalized.min():.6f}, {data_normalized.max():.6f}]")
+    height, width, min_val, max_val, original_dtype = scan_tiff_metadata(tiff_files)
     
     # Set up EBCC compression
-    print("\n3. Configuring EBCC compression...")
+    print("\n2. Configuring EBCC compression...")
     
     if args.residual_mode == 'none':
         residual_opt = None
@@ -306,9 +343,6 @@ def main():
         residual_opt = (args.residual_mode, args.residual_target)
         print(f"Residual mode: {args.residual_mode}")
         print(f"Residual target: {args.residual_target}")
-    
-    # Data shape: (num_frames, height, width)
-    num_frames, height, width = data_normalized.shape
     
     ebcc_filter = EBCC_Filter(
         base_cr=args.base_cr,
@@ -329,10 +363,10 @@ def main():
         print(f"Removed existing file: {output_path}")
     
     # Create HDF5 file and compress
-    print("\n4. Compressing data with EBCC...")
+    print("\n3. Compressing data with EBCC (streaming mode)...")
 
     if not args.parallel:
-        # Original (single-process) path using HDF5 filter
+        # Sequential streaming path using HDF5 filter
         with h5py.File(output_path, 'w') as f:
             # Store metadata
             f.attrs['original_min'] = min_val
@@ -345,18 +379,29 @@ def main():
             if residual_opt:
                 f.attrs['residual_target'] = args.residual_target
 
-            # Create compressed dataset (EBCC HDF5 filter)
-            dset = f.create_dataset('compressed', shape=data_normalized.shape, **ebcc_filter)
+            # Create compressed dataset (EBCC HDF5 filter) with chunking for streaming
+            dset = f.create_dataset(
+                'compressed',
+                shape=(num_frames, height, width),
+                dtype=np.float32,
+                chunks=(1, height, width),  # One frame per chunk for streaming
+                **ebcc_filter
+            )
 
-            # Write data
-            print("Writing compressed data (single-process)...")
-            dset[:] = data_normalized
+            # Write data frame by frame (streaming)
+            print("Writing compressed data (streaming, single-process)...")
+            for i in tqdm(range(num_frames), desc="Compressing frames"):
+                frame = load_single_tiff_frame(tiff_files[i])
+                frame_normalized = normalize_data(frame, min_val, max_val)
+                dset[i] = frame_normalized
 
-            # Read back to verify
-            print("Reading back compressed data...")
-            data_reconstructed = dset[:]
+            # Read back to verify - also streaming
+            print("Reading back compressed data (streaming)...")
+            data_reconstructed = np.zeros((num_frames, height, width), dtype=np.float32)
+            for i in tqdm(range(num_frames), desc="Decompressing frames"):
+                data_reconstructed[i] = dset[i]
     else:
-        # Parallel path: call native ebcc_encode per-frame using ctypes in worker processes
+        # Parallel streaming path: process frames in batches
         print(f"Parallel mode enabled: using {args.workers} workers")
 
         # Residual mapping
@@ -381,23 +426,43 @@ def main():
             vlen_dt = h5py.vlen_dtype(np.dtype('uint8'))
             dset = f.create_dataset('compressed_vlen', shape=(num_frames,), dtype=vlen_dt)
 
-            # Prepare tasks
-            tasks = [(i, data_normalized[i]) for i in range(num_frames)]
-
-            # Run pool
+            # Streaming batch processing with parallel compression
+            batch_size = args.batch_size if args.batch_size else (args.workers * 2)
+            print(f"Batch size: {batch_size} frames (keeps {args.workers} workers busy)")
+            print(f"Memory footprint per batch: ~{batch_size * height * width * 4 / 1e6:.2f} MB")
+            
             mp_ctx = mp.get_context('spawn')
-            init_args = (EBCC_FILTER_PATH, 1, height, width, float(args.base_cr), int(residual_map.get(args.residual_mode, 2)), float(args.residual_target))
+            init_args = (EBCC_FILTER_PATH, 1, height, width, float(args.base_cr), 
+                        int(residual_map.get(args.residual_mode, 2)), float(args.residual_target))
+            
             with mp_ctx.Pool(processes=args.workers, initializer=init_worker, initargs=init_args) as pool:
-                for idx, buf in pool.imap_unordered(compress_frame_worker, tasks, chunksize=1):
-                    # write compressed bytes as uint8 array into vlen dataset
-                    dset[idx] = np.frombuffer(buf, dtype=np.uint8)
+                num_batches = (num_frames + batch_size - 1) // batch_size
+                print(f"Processing {num_frames} frames in {num_batches} batches...")
+                
+                frames_processed = 0
+                with tqdm(total=num_frames, desc="Compressing frames", unit="frame") as pbar:
+                    for batch_start in range(0, num_frames, batch_size):
+                        batch_end = min(batch_start + batch_size, num_frames)
+                        current_batch_size = batch_end - batch_start
+                        
+                        # Load batch of frames (streaming - only current batch in memory)
+                        batch_tasks = []
+                        for i in range(batch_start, batch_end):
+                            frame = load_single_tiff_frame(tiff_files[i])
+                            frame_normalized = normalize_data(frame, min_val, max_val)
+                            batch_tasks.append((i, frame_normalized))
+                        
+                        # Compress batch in parallel
+                        for idx, buf in pool.imap_unordered(compress_frame_worker, batch_tasks):
+                            dset[idx] = np.frombuffer(buf, dtype=np.uint8)
+                            frames_processed += 1
+                            pbar.update(1)
 
-            # For compatibility keep a placeholder 'reconstructed' dataset by decoding one frame (optional)
             print("Parallel compression finished; compressed frames stored in 'compressed_vlen' dataset")
 
-        # After parallel compression we can (optionally) decode all frames serially to compute metrics
-        print("Decoding compressed frames (serial) for verification...")
-        data_reconstructed = np.zeros_like(data_normalized, dtype=np.float32)
+        # After parallel compression, decode frames for verification (streaming)
+        print("Decoding compressed frames (streaming) for verification...")
+        data_reconstructed = np.zeros((num_frames, height, width), dtype=np.float32)
         # load library in main process
         lib_main = ctypes.CDLL(EBCC_FILTER_PATH)
         lib_main.ebcc_decode.argtypes = (ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.POINTER(ctypes.c_float)))
@@ -406,7 +471,7 @@ def main():
         lib_main.free_buffer.restype = None
         with h5py.File(output_path, 'r') as f:
             dset_v = f['compressed_vlen']
-            for i in range(num_frames):
+            for i in tqdm(range(num_frames), desc="Decompressing frames"):
                 comp = np.ascontiguousarray(dset_v[i])
                 comp_ptr = comp.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
                 out_ptr = ctypes.POINTER(ctypes.c_float)()
@@ -421,49 +486,59 @@ def main():
     print("Compression complete!")
     
     # Calculate file sizes and compression ratio
-    print("\n5. Analyzing compression performance...")
-    # Original size: TIFF files are uint16 (2 bytes per pixel), but we load as float32 in memory
-    original_size_uint16 = num_frames * height * width * 2  # 2 bytes for uint16
-    original_size_float32 = data_original.nbytes  # float32 in memory
+    print("\n4. Analyzing compression performance...")
+    # Original size: TIFF files are uint16 (2 bytes per pixel)
+    bytes_per_pixel = np.dtype(original_dtype).itemsize
+    original_size_on_disk = num_frames * height * width * bytes_per_pixel
+    original_size_float32 = num_frames * height * width * 4  # float32 is 4 bytes
     compressed_size = os.path.getsize(output_path)
-    compression_ratio_vs_uint16 = original_size_uint16 / compressed_size
+    compression_ratio_vs_original = original_size_on_disk / compressed_size
     compression_ratio_vs_float32 = original_size_float32 / compressed_size
-    space_savings_vs_uint16 = (1 - compressed_size / original_size_uint16) * 100
+    space_savings_vs_original = (1 - compressed_size / original_size_on_disk) * 100
     
-    print(f"Original size (uint16 on disk): {original_size_uint16 / 1e6:.2f} MB")
+    print(f"Original size ({original_dtype} on disk): {original_size_on_disk / 1e6:.2f} MB")
     print(f"Original size (float32 in memory): {original_size_float32 / 1e6:.2f} MB")
     print(f"Compressed size: {compressed_size / 1e6:.2f} MB")
-    print(f"Compression ratio (vs uint16): {compression_ratio_vs_uint16:.2f}:1")
+    print(f"Compression ratio (vs {original_dtype}): {compression_ratio_vs_original:.2f}:1")
     print(f"Compression ratio (vs float32): {compression_ratio_vs_float32:.2f}:1")
-    print(f"Space savings (vs uint16): {space_savings_vs_uint16:.1f}%")
+    print(f"Space savings (vs {original_dtype}): {space_savings_vs_original:.1f}%")
     
-    # Denormalize reconstructed data for quality metrics
+    # Compute quality metrics (streaming)
+    print("\n5. Computing quality metrics (streaming)...")
+    
+    # We'll compute metrics frame by frame without loading all original data
+    psnr_per_frame = []
+    ssim_per_frame = []
+    max_abs_errors = []
+    
+    # Denormalize reconstructed data first
     data_reconstructed_original = denormalize_data(data_reconstructed, min_val, max_val)
     
-    # Compute quality metrics
-    print("\n6. Computing quality metrics...")
-    
-    # Overall metrics
-    psnr = compute_psnr(data_original, data_reconstructed_original)
-    ssim = compute_ssim_simple(data_original, data_reconstructed_original)
-    
-    # Per-frame metrics
-    psnr_per_frame = []
-    for i in range(num_frames):
-        frame_psnr = compute_psnr(data_original[i], data_reconstructed_original[i])
+    for i in tqdm(range(num_frames), desc="Computing metrics"):
+        # Load original frame
+        frame_original = load_single_tiff_frame(tiff_files[i])
+        frame_reconstructed = data_reconstructed_original[i]
+        
+        # Per-frame metrics
+        frame_psnr = compute_psnr(frame_original, frame_reconstructed)
+        frame_ssim = compute_ssim_simple(frame_original, frame_reconstructed)
+        frame_max_error = np.max(np.abs(frame_original - frame_reconstructed))
+        
         psnr_per_frame.append(frame_psnr)
+        ssim_per_frame.append(frame_ssim)
+        max_abs_errors.append(frame_max_error)
     
     avg_psnr = np.mean(psnr_per_frame)
     min_psnr = np.min(psnr_per_frame)
     max_psnr = np.max(psnr_per_frame)
+    avg_ssim = np.mean(ssim_per_frame)
+    max_abs_error = np.max(max_abs_errors)
     
-    print(f"Overall PSNR: {psnr:.2f} dB")
     print(f"Average PSNR (per frame): {avg_psnr:.2f} dB")
     print(f"PSNR range: [{min_psnr:.2f}, {max_psnr:.2f}] dB")
-    print(f"Overall SSIM: {ssim:.6f}")
+    print(f"Average SSIM: {avg_ssim:.6f}")
     
     # Error analysis
-    max_abs_error = np.max(np.abs(data_original - data_reconstructed_original))
     data_range = max_val - min_val
     if data_range > 0:
         rel_error = max_abs_error / data_range
@@ -473,12 +548,12 @@ def main():
         print(f"Max absolute error: {max_abs_error:.2e}")
     
     # Bits per pixel
-    original_bits_per_pixel_uint16 = 16  # Original TIFF files are uint16
+    original_bits_per_pixel = bytes_per_pixel * 8
     original_bits_per_pixel_float32 = 32  # In-memory representation
     compressed_bits_per_pixel = (compressed_size * 8) / (num_frames * height * width)
     
     print(f"\nBits per pixel:")
-    print(f"  Original (uint16 on disk): {original_bits_per_pixel_uint16:.2f}")
+    print(f"  Original ({original_dtype} on disk): {original_bits_per_pixel:.2f}")
     print(f"  Original (float32 in memory): {original_bits_per_pixel_float32:.2f}")
     print(f"  Compressed: {compressed_bits_per_pixel:.2f}")
     
@@ -489,11 +564,11 @@ def main():
     print(f"Source: TIFF sequence from {args.tiff_dir}")
     print(f"Frames processed: {num_frames} (offset: {args.start_offset})")
     print(f"Frame dimensions: {width} x {height}")
-    print(f"Compression ratio (vs uint16): {compression_ratio_vs_uint16:.2f}:1")
+    print(f"Compression ratio (vs {original_dtype}): {compression_ratio_vs_original:.2f}:1")
     print(f"Compression ratio (vs float32): {compression_ratio_vs_float32:.2f}:1")
-    print(f"Space savings (vs uint16): {space_savings_vs_uint16:.1f}%")
-    print(f"PSNR: {psnr:.2f} dB")
-    print(f"SSIM: {ssim:.6f}")
+    print(f"Space savings (vs {original_dtype}): {space_savings_vs_original:.1f}%")
+    print(f"PSNR: {avg_psnr:.2f} dB")
+    print(f"SSIM: {avg_ssim:.6f}")
     print(f"Output file: {output_path}")
     print("=" * 70)
     
@@ -503,7 +578,7 @@ def main():
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         
-        print("\n7. Creating visualization...")
+        print("\n6. Creating visualization...")
         
         # Select frames to visualize
         vis_frames = [i for i in args.compare_frames if i < num_frames]
@@ -517,18 +592,22 @@ def main():
                         fontsize=16, fontweight='bold')
             
             for i, frame_idx in enumerate(vis_frames):
+                # Load original frame for visualization
+                frame_original = load_single_tiff_frame(tiff_files[frame_idx])
+                frame_reconstructed = data_reconstructed_original[frame_idx]
+                
                 # Original
-                axes[0, i].imshow(data_original[frame_idx], cmap='gray')
+                axes[0, i].imshow(frame_original, cmap='gray')
                 axes[0, i].set_title(f'Original Frame {frame_idx}')
                 axes[0, i].axis('off')
                 
                 # Reconstructed
-                axes[1, i].imshow(data_reconstructed_original[frame_idx], cmap='gray')
+                axes[1, i].imshow(frame_reconstructed, cmap='gray')
                 axes[1, i].set_title(f'Reconstructed Frame {frame_idx}')
                 axes[1, i].axis('off')
                 
                 # Difference
-                diff = np.abs(data_original[frame_idx] - data_reconstructed_original[frame_idx])
+                diff = np.abs(frame_original - frame_reconstructed)
                 im = axes[2, i].imshow(diff, cmap='hot')
                 axes[2, i].set_title(f'Difference\nMax: {diff.max():.2e}')
                 axes[2, i].axis('off')
